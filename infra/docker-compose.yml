@@ -1,0 +1,187 @@
+name: streaming-demo
+
+services:
+  # ------------------------------------------------------------------
+  #  Kafka (KRaft mode — no Zookeeper)
+  # ------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.7.1
+    container_name: kafka
+    ports:
+      - "29092:29092"   # host access
+    environment:
+      CLUSTER_ID: "streaming-demo-cluster"
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "controller,broker"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+    networks: [streaming]
+
+  redpanda-console:
+    image: redpandadata/console:v2.7.2
+    container_name: redpanda-console
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "9021:8080"
+    environment:
+      KAFKA_BROKERS: "kafka:9092"
+    networks: [streaming]
+
+  # ------------------------------------------------------------------
+  #  FastAPI backend
+  # ------------------------------------------------------------------
+  fastapi:
+    build:
+      context: ../api
+      dockerfile: Dockerfile
+    container_name: fastapi
+    user: "0:0"
+    environment:
+      BRONZE_PATH: /data/bronze
+      SILVER_PATH: /data/silver
+      GOLD_PATH: /data/gold
+      LOG_LEVEL: INFO
+    volumes:
+      - ../data:/data
+    ports:
+      - "8000:8000"
+    networks: [streaming]
+
+  # ------------------------------------------------------------------
+  #  Mock producer (Faker → Kafka)
+  # ------------------------------------------------------------------
+  producer:
+    build:
+      context: ../producer
+      dockerfile: Dockerfile
+    container_name: mock-producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC_ORDERS: raw.orders
+      KAFKA_TOPIC_CLICKS: raw.clicks
+      EVENTS_PER_SECOND: "${EVENTS_PER_SECOND:-5}"
+      PRODUCER_LOG_LEVEL: INFO
+    networks: [streaming]
+
+  # ------------------------------------------------------------------
+  #  Spark Structured Streaming (Kafka → Bronze Delta)
+  # ------------------------------------------------------------------
+  spark-streaming:
+    build:
+      context: ../spark
+      dockerfile: Dockerfile
+    container_name: spark-streaming
+    user: "0:0"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      fastapi:
+        condition: service_started
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC_ORDERS: raw.orders
+      KAFKA_TOPIC_CLICKS: raw.clicks
+      BRONZE_PATH: /data/bronze
+      SILVER_PATH: /data/silver
+      GOLD_PATH: /data/gold
+      CHECKPOINT_PATH: /data/checkpoints
+      STREAM_TRIGGER_SECONDS: "5"
+      API_INTERNAL_URL: http://fastapi:8000
+      LOG_LEVEL: INFO
+    volumes:
+      - ../data:/data
+    ports:
+      - "8080:4040"  # Spark Application UI
+    networks: [streaming]
+
+  # ------------------------------------------------------------------
+  #  Spark batch scheduler (keeps refreshing Silver + Gold every N seconds)
+  # ------------------------------------------------------------------
+  spark-scheduler:
+    build:
+      context: ../spark
+      dockerfile: Dockerfile
+    container_name: spark-scheduler
+    user: "0:0"
+    depends_on:
+      spark-streaming:
+        condition: service_started
+    environment:
+      BRONZE_PATH: /data/bronze
+      SILVER_PATH: /data/silver
+      GOLD_PATH: /data/gold
+      BATCH_INTERVAL_SECONDS: "30"
+      BATCH_INITIAL_DELAY_SECONDS: "20"
+      LOG_LEVEL: INFO
+    volumes:
+      - ../data:/data
+    entrypoint: ["/opt/spark/bin/spark-submit",
+                 "--packages", "io.delta:delta-spark_2.12:3.2.1",
+                 "--conf", "spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension",
+                 "--conf", "spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog",
+                 "/app/scheduler.py"]
+    networks: [streaming]
+
+  # ------------------------------------------------------------------
+  #  Spark batch runner (on-demand via `docker compose run`)
+  # ------------------------------------------------------------------
+  spark-batch:
+    build:
+      context: ../spark
+      dockerfile: Dockerfile
+    profiles: ["batch"]
+    user: "0:0"
+    environment:
+      BRONZE_PATH: /data/bronze
+      SILVER_PATH: /data/silver
+      GOLD_PATH: /data/gold
+      LOG_LEVEL: INFO
+    volumes:
+      - ../data:/data
+    # overridden via `docker compose run --rm spark-batch ...`
+    entrypoint: ["/opt/spark/bin/spark-submit",
+                 "--packages", "io.delta:delta-spark_2.12:3.2.1",
+                 "--conf", "spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension",
+                 "--conf", "spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog"]
+    networks: [streaming]
+
+  # ------------------------------------------------------------------
+  #  React dashboard
+  # ------------------------------------------------------------------
+  dashboard:
+    build:
+      context: ../dashboard
+      dockerfile: Dockerfile
+    container_name: dashboard
+    depends_on:
+      - fastapi
+    ports:
+      - "3001:3000"
+    networks: [streaming]
+
+networks:
+  streaming:
+    driver: bridge
